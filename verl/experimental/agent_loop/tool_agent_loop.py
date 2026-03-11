@@ -128,9 +128,9 @@ class ToolAgentLoop(AgentLoopBase):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
-        mcp_servers = kwargs["extra_info"].get("mcp_servers", [])
-        initial_config = kwargs["extra_info"].get("initial_config", {})
-        final_config = kwargs["extra_info"].get("final_config", {})
+        mcp_servers = kwargs.get("mcp_servers", [])
+        initial_config = kwargs.get("initial_config", {})
+        final_config = kwargs.get("final_config", {})
 
         # extract images and videos from messages
         multi_modal_data = await self.process_vision_info(messages)
