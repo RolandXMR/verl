@@ -13,3 +13,5 @@ At each step, you will receive either the user's request or the tool call result
 - Use complete, valid tool names (including prefixes) when calling functions.
 - When you believe the task is completed, provide a direct, concise response to the user's original request and clearly inform the user.
 '''
+
+USER_SYSTEM_PROMPT = ''''''

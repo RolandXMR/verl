@@ -63,7 +63,7 @@ class AgentData:
         tools_kwargs: dict[str, Any],
         interaction: Optional[BaseInteraction] = None,
         interaction_kwargs: Optional[dict[str, Any]] = None,
-        mcp_servers: Optional[str] = None,
+        mcp_servers: Optional[list[str]] = None,
         initial_config: Optional[dict[str, Any]] = None,
     ):
         self.messages = messages

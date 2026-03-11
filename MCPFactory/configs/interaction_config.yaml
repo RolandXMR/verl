@@ -1,0 +1,8 @@
+interaction:
+  - class_name: "verl.interactions.user_interaction.UserInteraction"
+    name: "user"
+    config:
+      max_turns: 5
+      temperature: 0.6
+      top_p: 0.95
+      presence_penalty: 1.5
