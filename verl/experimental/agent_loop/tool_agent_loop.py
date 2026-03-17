@@ -26,9 +26,10 @@ from verl.experimental.agent_loop.utils import add_generation_prompt_for_gpt_oss
 from verl.interactions.base import BaseInteraction
 from verl.interactions.utils.interaction_registry import initialize_interactions_from_config
 from verl.tools.schemas import ToolResponse
-from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+
+from MCPFactory.manager.mcp_client_manager import MCPManager
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -54,6 +55,8 @@ class AgentData:
         tools_kwargs: dict[str, Any],
         interaction: Optional[BaseInteraction] = None,
         interaction_kwargs: Optional[dict[str, Any]] = None,
+        mcp_servers: Optional[str] = None,
+        initial_config: Optional[dict[str, Any]] = None,
     ):
         self.messages = messages
         self.image_data = image_data
@@ -76,6 +79,11 @@ class AgentData:
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
 
+        # Extra information for MCPFactory
+        self.client_ids = []
+        self.mcp_servers = mcp_servers
+        self.initial_config = initial_config
+
 
 @register("tool_agent")
 class ToolAgentLoop(AgentLoopBase):
@@ -94,13 +102,11 @@ class ToolAgentLoop(AgentLoopBase):
         cls.max_parallel_calls = config.actor_rollout_ref.rollout.multi_turn.max_parallel_calls
         cls.max_tool_response_length = config.actor_rollout_ref.rollout.multi_turn.max_tool_response_length
         cls.tool_response_truncate_side = config.actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side
-        tool_config_path = config.actor_rollout_ref.rollout.multi_turn.tool_config_path
-        tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
-        cls.tools = {tool.name: tool for tool in tool_list}
-        cls.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
+        cls.tools = MCPManager.tools
+        cls.tool_schemas = MCPManager.tool_schemas
         cls.tool_parser = ToolParser.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format, cls.tokenizer)
         cls.tool_parser_name = config.actor_rollout_ref.rollout.multi_turn.format
-        print(f"Initialized tools: {cls.tools}")
+        logger.info(f"Initialize {len(MCPManager.server_to_path_mapping)} Servers with {len(MCPManager.tools)} Tools.")
 
         cls.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
         cls.prompt_length = config.actor_rollout_ref.rollout.prompt_length
@@ -121,14 +127,20 @@ class ToolAgentLoop(AgentLoopBase):
         request_id = uuid4().hex
         tools_kwargs = kwargs.get("tools_kwargs", {})
 
+        # Prepare
+        mcp_servers = kwargs["mcp_servers"]
+        initial_config = kwargs["initial_config"]
+        final_config = kwargs["final_config"]
+
         # Initialize interaction if needed
         interaction = None
         interaction_kwargs = {}
         if self.interaction_config_file:
-            interaction_kwargs = kwargs["extra_info"]["interaction_kwargs"]
-            if "name" not in interaction_kwargs:
-                raise ValueError("'name' key is required in interaction_kwargs")
-            interaction_name = interaction_kwargs["name"]
+            interaction_kwargs = kwargs["interaction_kwargs"]
+            interaction_kwargs = {
+                "initial_config": initial_config
+            }
+            interaction_name = interaction_kwargs.get("name", "user")
             if interaction_name not in self.interaction_map:
                 raise ValueError(
                     f"Interaction '{interaction_name}' not found in interaction_map. Available interactions: "
@@ -145,6 +157,8 @@ class ToolAgentLoop(AgentLoopBase):
             tools_kwargs=tools_kwargs,
             interaction=interaction,
             interaction_kwargs=interaction_kwargs,
+            mcp_servers=mcp_servers,
+            initial_config=initial_config,
         )
 
         # State machine loop
@@ -162,6 +176,13 @@ class ToolAgentLoop(AgentLoopBase):
                 logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
 
+        # Save all scenarios
+        final_scenarios = MCPManager.save_all_scenario(agent_data.client_ids)
+
+        # Close all clients
+        for client_id in agent_data.client_ids:
+            MCPManager.close_client(client_id)
+
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
         prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
@@ -176,7 +197,10 @@ class ToolAgentLoop(AgentLoopBase):
             else None,
             num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
             metrics=agent_data.metrics,
-            extra_fields={},
+            extra_fields={
+                "sol_final_config": final_scenarios,
+                "gts_final_config": final_config,
+            },
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
         return output
@@ -188,7 +212,7 @@ class ToolAgentLoop(AgentLoopBase):
                 None,
                 lambda: self.processor.apply_chat_template(
                     agent_data.messages,
-                    tools=self.tool_schemas,
+                    tools=MCPManager.filter_tools(agent_data.mcp_servers),
                     add_generation_prompt=True,
                     tokenize=False,
                     **self.apply_chat_template_kwargs,
@@ -201,12 +225,13 @@ class ToolAgentLoop(AgentLoopBase):
                 None,
                 lambda: self.tokenizer.apply_chat_template(
                     agent_data.messages,
-                    tools=self.tool_schemas,
+                    tools=MCPManager.filter_tools(agent_data.mcp_servers),
                     add_generation_prompt=True,
                     tokenize=True,
                     **self.apply_chat_template_kwargs,
                 ),
             )
+        assert len(agent_data.prompt_ids) < self.prompt_length, f"Exceeding the max promopt length: {self.prompt_length}, got {len(agent_data.prompt_ids)}."
         return AgentState.GENERATING
 
     async def _handle_generating_state(
@@ -264,8 +289,8 @@ class ToolAgentLoop(AgentLoopBase):
 
         tasks = []
         tool_call_names = []
-        for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
-            tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs))
+        for tool_call in agent_data.tool_calls:
+            tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
             tool_call_names.append(tool_call.name)
 
         with simple_timer("tool_calls", agent_data.metrics):
@@ -428,19 +453,40 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.GENERATING
 
     async def _call_tool(
-        self, tool_call: FunctionCall, tools_kwargs: dict[str, Any]
+        self, tool_call: FunctionCall, tools_kwargs: dict[str, Any], agent_data: AgentData
     ) -> tuple[ToolResponse, float, dict]:
         """Call tool and return tool response."""
         tool, instance_id = None, None
         try:
             # TODO: append malformed tool_call to the prompt: invalid function name or arguments
             tool_name = tool_call.name
+            server_name = tool_name.split("-")[0]
             tool_args = json.loads(tool_call.arguments)
-            tool = self.tools[tool_name]
             kwargs = tools_kwargs.get(tool_name, {})
-            instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
-            tool_execution_response, tool_reward, res = await tool.execute(instance_id, tool_args)
+
+            if tool_name not in self.tools:
+                raise ValueError(f"Unrecognized tool name {tool_name} for tool calling.")
+
+            client_id = f"{server_name}-{agent_data.request_id}"
+            if client_id not in agent_data.client_ids:
+                agent_data.client_ids.append(client_id)
+
+
+            # Load scenario
+            tool_execution_response = MCPManager.load_scenario(
+                scenario = agent_data.initial_config[server_name],
+                client_id = client_id, check = False,
+            )
+
+            # Call tool
+            tool_execution_response = MCPManager.call_tool(
+                tool_name = tool_name,
+                tool_args = tool_args,
+                client_id = client_id,
+            )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"Error when executing tool: {e}")
             return (
                 ToolResponse(
@@ -449,11 +495,8 @@ class ToolAgentLoop(AgentLoopBase):
                 0.0,
                 {},
             )
-        finally:
-            if tool and instance_id:
-                await tool.release(instance_id)
 
-        tool_response_text = tool_execution_response.text
+        tool_response_text = tool_execution_response
         if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
             if self.tool_response_truncate_side == "left":
                 tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
@@ -473,7 +516,7 @@ class ToolAgentLoop(AgentLoopBase):
                 if attr_value is not None:
                     tool_response_kwargs[attr_name] = attr_value
 
-        return ToolResponse(**tool_response_kwargs), tool_reward, res
+        return ToolResponse(**tool_response_kwargs), 1.0, {}
 
     @classmethod
     def _initialize_interactions(cls, interaction_config_file):

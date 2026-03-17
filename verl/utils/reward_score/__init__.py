@@ -102,6 +102,11 @@ def default_compute_score(
         from . import search_r1_like_qa_em
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
+    
+    elif data_source in ["mcp_factory", "MCPFactory"]:
+        from . import mcp_factory
+
+        res = mcp_factory.compute_score(solution_str, ground_truth, extra_info)
 
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")

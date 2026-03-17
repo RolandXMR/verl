@@ -18,6 +18,7 @@ import copy
 import logging
 import os
 import re
+import json
 import traceback
 from collections import defaultdict
 from typing import Optional
@@ -31,6 +32,9 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
+
+from MCPFactory.configs.system_prompt import ASSISTANT_SYSTEM_PROMPT
+from MCPFactory.manager.mcp_client_manager import MCPManager
 
 logger = logging.getLogger(__name__)
 
@@ -112,21 +116,7 @@ class RLHFDataset(Dataset):
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
-
-        self.tool_config_path = config.get("tool_config_path", None)
-        self.tool_schemas = None
-        if self.tool_config_path:
-            try:
-                from verl.tools.utils.tool_registry import initialize_tools_from_config
-
-                tool_list = initialize_tools_from_config(self.tool_config_path)
-                # match ToolAgentLoop behaviour: model_dump to plain dicts
-                self.tool_schemas = [
-                    tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list
-                ]
-            except Exception as e:
-                logger.warning("Failed to initialize tools from %s: %s", self.tool_config_path, e)
-                self.tool_schemas = None
+        self.trace_reward_weight = config.get("trace_reward_weight", 0.5)
 
         self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
         self.num_workers = min(self.num_workers, os.cpu_count()) if self.num_workers is not None else None
@@ -152,8 +142,13 @@ class RLHFDataset(Dataset):
     def _read_files_and_tokenize(self):
         dataframes = []
         for parquet_file in self.data_files:
-            # read parquet files and cache
-            dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+            # read files and cache
+            if parquet_file.endswith(".parquet"):
+                dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+            elif parquet_file.endswith(".json") or parquet_file.endswith(".jsonl"):
+                dataframe = datasets.load_dataset("json", data_files=parquet_file)["train"]
+            else:
+                raise ValueError(f"Unsupported file format: {parquet_file}")
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
@@ -189,8 +184,9 @@ class RLHFDataset(Dataset):
                         messages = self._build_messages(doc)
                         # pass tool schemas if available so the processor can format prompts
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
+                        mcp_servers = doc['extra_info']['mcp_factory_kwargs']['mcp_servers']
+                        mcp_servers = json.loads(mcp_servers)
+                        apply_kwargs["tools"] = MCPManager.filter_tools(mcp_servers)
 
                         raw_prompt = self.processor.apply_chat_template(
                             messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
@@ -233,12 +229,14 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     try:
+                        messages = self._build_messages(doc)
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
+                        mcp_servers = doc['extra_info']['mcp_factory_kwargs']['mcp_servers']
+                        mcp_servers = json.loads(mcp_servers)
+                        apply_kwargs["tools"] = MCPManager.filter_tools(mcp_servers)
 
                         return len(
-                            tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True, **apply_kwargs)
+                            tokenizer.apply_chat_template(messages, add_generation_prompt=True, **apply_kwargs)
                         )
                     except Exception:
                         print("Error processing one of the samples, skipping...")
@@ -268,6 +266,12 @@ class RLHFDataset(Dataset):
 
     def _build_messages(self, example: dict):
         messages: list = example.pop(self.prompt_key)
+        if isinstance(messages, str):
+            messages = json.loads(messages)
+
+        data_source: str = example["data_source"]
+        if data_source in ["MCPFactory", "mcp_factory"]:
+            messages = [{"role": "system", "content": ASSISTANT_SYSTEM_PROMPT}] + messages
 
         if self.image_key in example or self.video_key in example:
             for message in messages:
@@ -450,6 +454,13 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+        row_dict["trace_reward_weight"] = self.trace_reward_weight
+        mcp_factory_kwargs = row_dict.get("extra_info", {}).get("mcp_factory_kwargs", {})
+        for k, v in mcp_factory_kwargs.items():
+            try:
+                row_dict[k] = json.loads(v)
+            except json.JSONDecodeError as e:
+                row_dict[k] = v
         return row_dict
 
     def __getstate__(self):

@@ -129,3 +129,8 @@ logs
 log
 outputs
 .history
+
+*data*
+*log*
+*output*
+*models*
