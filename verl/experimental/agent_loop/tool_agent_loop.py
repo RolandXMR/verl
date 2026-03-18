@@ -29,7 +29,28 @@ from verl.tools.schemas import ToolResponse
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 
-from MCPFactory.manager.mcp_client_manager import MCPManager
+import ray
+from MCPFactory.manager.mcp_client_manager import (
+    get_mcp_actor,
+    call_tool_distributed,
+    load_scenario_distributed,
+    save_all_scenario_distributed,
+    close_client_distributed,
+    get_tools_distributed,
+    get_tool_schemas_distributed,
+    filter_tools_distributed,
+    MCPManager,
+)
+
+# Determine if we're using distributed mode based on Ray initialization
+# Use a function to check at runtime instead of import time to avoid race conditions
+def _use_distributed_mcp():
+    """Check if we should use distributed MCP at runtime."""
+    return ray.is_initialized()
+
+
+# Backward compatibility - will be removed in future
+_USE_DISTRIBUTED_MCP = _use_distributed_mcp()
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -102,11 +123,23 @@ class ToolAgentLoop(AgentLoopBase):
         cls.max_parallel_calls = config.actor_rollout_ref.rollout.multi_turn.max_parallel_calls
         cls.max_tool_response_length = config.actor_rollout_ref.rollout.multi_turn.max_tool_response_length
         cls.tool_response_truncate_side = config.actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side
-        cls.tools = MCPManager.tools
-        cls.tool_schemas = MCPManager.tool_schemas
+        
+        # Get tools from MCPManager (distributed or local)
+        global _USE_DISTRIBUTED_MCP
+        if _USE_DISTRIBUTED_MCP:
+            cls.tools = get_tools_distributed()
+            cls.tool_schemas = get_tool_schemas_distributed()
+            # Get server mapping from actor
+            mcp_actor = get_mcp_actor()
+            server_mapping = ray.get(mcp_actor.server_to_path_mapping)
+            logger.info(f"Initialize {len(server_mapping)} Servers with {len(cls.tools)} Tools (distributed mode).")
+        else:
+            cls.tools = MCPManager.tools
+            cls.tool_schemas = MCPManager.tool_schemas
+            logger.info(f"Initialize {len(MCPManager.server_to_path_mapping)} Servers with {len(MCPManager.tools)} Tools (local mode).")
+        
         cls.tool_parser = ToolParser.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format, cls.tokenizer)
         cls.tool_parser_name = config.actor_rollout_ref.rollout.multi_turn.format
-        logger.info(f"Initialize {len(MCPManager.server_to_path_mapping)} Servers with {len(MCPManager.tools)} Tools.")
 
         cls.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
         cls.prompt_length = config.actor_rollout_ref.rollout.prompt_length
@@ -177,11 +210,16 @@ class ToolAgentLoop(AgentLoopBase):
                 state = AgentState.TERMINATED
 
         # Save all scenarios
-        final_scenarios = MCPManager.save_all_scenario(agent_data.client_ids)
-
-        # Close all clients
-        for client_id in agent_data.client_ids:
-            MCPManager.close_client(client_id)
+        if _USE_DISTRIBUTED_MCP:
+            final_scenarios = save_all_scenario_distributed(agent_data.client_ids)
+            # Close all clients
+            for client_id in agent_data.client_ids:
+                close_client_distributed(client_id)
+        else:
+            final_scenarios = MCPManager.save_all_scenario(agent_data.client_ids)
+            # Close all clients
+            for client_id in agent_data.client_ids:
+                MCPManager.close_client(client_id)
 
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
@@ -207,12 +245,18 @@ class ToolAgentLoop(AgentLoopBase):
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
+        # Get filtered tools (distributed or local)
+        if _USE_DISTRIBUTED_MCP:
+            filtered_tools = filter_tools_distributed(agent_data.mcp_servers)
+        else:
+            filtered_tools = MCPManager.filter_tools(agent_data.mcp_servers)
+        
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
                 None,
                 lambda: self.processor.apply_chat_template(
                     agent_data.messages,
-                    tools=MCPManager.filter_tools(agent_data.mcp_servers),
+                    tools=filtered_tools,
                     add_generation_prompt=True,
                     tokenize=False,
                     **self.apply_chat_template_kwargs,
@@ -225,7 +269,7 @@ class ToolAgentLoop(AgentLoopBase):
                 None,
                 lambda: self.tokenizer.apply_chat_template(
                     agent_data.messages,
-                    tools=MCPManager.filter_tools(agent_data.mcp_servers),
+                    tools=filtered_tools,
                     add_generation_prompt=True,
                     tokenize=True,
                     **self.apply_chat_template_kwargs,
@@ -471,19 +515,29 @@ class ToolAgentLoop(AgentLoopBase):
             if client_id not in agent_data.client_ids:
                 agent_data.client_ids.append(client_id)
 
-
-            # Load scenario
-            tool_execution_response = MCPManager.load_scenario(
-                scenario = agent_data.initial_config[server_name],
-                client_id = client_id, check = False,
-            )
-
-            # Call tool
-            tool_execution_response = MCPManager.call_tool(
-                tool_name = tool_name,
-                tool_args = tool_args,
-                client_id = client_id,
-            )
+            # Load scenario and call tool (distributed or local)
+            if _USE_DISTRIBUTED_MCP:
+                tool_execution_response = load_scenario_distributed(
+                    client_id=client_id,
+                    scenario=agent_data.initial_config[server_name],
+                    check=False,
+                )
+                tool_execution_response = call_tool_distributed(
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    client_id=client_id,
+                )
+            else:
+                tool_execution_response = MCPManager.load_scenario(
+                    scenario=agent_data.initial_config[server_name],
+                    client_id=client_id,
+                    check=False,
+                )
+                tool_execution_response = MCPManager.call_tool(
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    client_id=client_id,
+                )
         except Exception as e:
             import traceback
             traceback.print_exc()

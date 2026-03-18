@@ -32,6 +32,26 @@ from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
 
 
+def initialize_mcp_manager_actor():
+    """
+    Initialize MCPManager Ray actor before spawning workers.
+    This ensures only one MCPManager instance exists across all GPU processes.
+    """
+    mcp_config_path = os.environ.get("MCP_CONFIG_PATH")
+    if mcp_config_path:
+        try:
+            # Import here to avoid issues if MCPFactory is not installed
+            from MCPFactory.manager.mcp_client_manager import initialize_mcp_actor
+            actor = initialize_mcp_actor(mcp_config_path)
+            print(f"[main_ppo] MCPManager Ray actor initialized with config: {mcp_config_path}")
+            return actor
+        except ImportError:
+            print("[main_ppo] MCPFactory not available, skipping MCPManager initialization")
+        except Exception as e:
+            print(f"[main_ppo] Warning: Failed to initialize MCPManager actor: {e}")
+    return None
+
+
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
     """Main entry point for PPO training with Hydra configuration management.
@@ -72,6 +92,10 @@ def run_ppo(config, task_runner_class=None) -> None:
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
+
+    # Initialize MCPManager Ray actor (singleton for distributed access)
+    # This must happen AFTER ray.init() but BEFORE spawning workers
+    initialize_mcp_manager_actor()
 
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
