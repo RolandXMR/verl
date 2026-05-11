@@ -37,6 +37,8 @@ from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
 
+import ray
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -60,6 +62,7 @@ class AgentData:
         metrics: dict[str, Any],
         request_id: str,
         tools_kwargs: dict[str, Any],
+        initial_config: Optional[dict[str, Any]] = None,
     ):
         self.messages = messages
         self.image_data = image_data
@@ -86,6 +89,9 @@ class AgentData:
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
 
+        self.client_ids = []
+        self.loaded_client_ids = set()
+        self.initial_config = initial_config
 
 @register("tool_agent")
 class ToolAgentLoop(AgentLoopBase):
@@ -106,21 +112,12 @@ class ToolAgentLoop(AgentLoopBase):
         self.max_parallel_calls = self.rollout_config.multi_turn.max_parallel_calls
         self.max_tool_response_length = self.rollout_config.multi_turn.max_tool_response_length
         self.tool_response_truncate_side = self.rollout_config.multi_turn.tool_response_truncate_side
-        tool_config_path = self.rollout_config.multi_turn.tool_config_path
-        tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
-        function_tool_list = function_tools.function_tools if function_tools else []
-        # TODO: move this to agent loop worker after refactoring native/mcp tools
-        if function_tool_list:
-            existing_names = {tool.name for tool in tool_list}
-            collisions = sorted(t.name for t in function_tool_list if t.name in existing_names)
-            assert not collisions, (
-                f"Function tool name(s) {collisions} collide with tools already declared in "
-                f"'{tool_config_path}'. Each tool name must be unique across `tool_config_path` "
-                f"and `function_tool_path`; rename one of them."
-            )
-            tool_list.extend(function_tool_list)
-        self.tools = {tool.name: tool for tool in tool_list}
-        self.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
+
+        self.mcp_manager_actor = ray.get_actor("mcp_manager")
+        self.tools = ray.get(self.mcp_manager_actor.get_tools.remote())
+        self.tool_schemas = ray.get(self.mcp_manager_actor.get_tool_schemas.remote())
+        logger.info(f"✅ Load {len(self.tools)} tools")
+
         self.tool_parser = ToolParser.get_tool_parser(self.rollout_config.multi_turn.format, self.tokenizer)
         self.tool_parser_name = self.rollout_config.multi_turn.format
 
@@ -130,6 +127,9 @@ class ToolAgentLoop(AgentLoopBase):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        mcp_servers = kwargs["mcp_servers"]
+        initial_config = kwargs["initial_config"]
+        final_config = kwargs["final_config"]
 
         # extract images and videos from messages
         multi_modal_data = await self.process_vision_info(messages)
@@ -147,17 +147,20 @@ class ToolAgentLoop(AgentLoopBase):
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
+            initial_config=initial_config,
         )
 
         # Per-sample tool selection: filter global tools by extra_info.tool_selection
-        extra_info = kwargs.get("extra_info", {}) or {}
-        tool_selection = extra_info.get("tool_selection")
-        if tool_selection and self.tools:
-            selected = {name: self.tools[name] for name in tool_selection if name in self.tools}
-            agent_data._active_tools = selected
-            agent_data._active_tool_schemas = [
-                t.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for t in selected.values()
-            ]
+        if mcp_servers and self.tools:
+            active_tools = {}
+            active_tool_schemas = []
+            for name, schema in self.tools.items():
+                server_name, _, tool_name = name.partition("-")
+                if server_name in mcp_servers and tool_name not in ["load_scenario", "save_scenario"]:
+                    active_tools[tool_name] = schema
+                    active_tool_schemas.append(schema)
+            agent_data._active_tools = active_tools
+            agent_data._active_tool_schemas = active_tool_schemas
         else:
             agent_data._active_tools = self.tools
             agent_data._active_tool_schemas = self.tool_schemas
@@ -174,6 +177,14 @@ class ToolAgentLoop(AgentLoopBase):
             else:
                 logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
+
+        # Save scenarios and close clients
+        if agent_data.client_ids:
+            final_scenarios = await self.mcp_manager_actor.save_and_close_clients.remote(
+                client_ids=agent_data.client_ids,
+            )
+        else:
+            final_scenarios = {}
 
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
@@ -202,6 +213,7 @@ class ToolAgentLoop(AgentLoopBase):
             extra_fields=agent_data.extra_fields,
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+        output.extra_fields.update({"sol_final_config": final_scenarios, "gts_final_config": final_config})
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
@@ -262,8 +274,7 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
 
         # Extract tool calls (use per-sample tools if routed)
-        active_tools = getattr(agent_data, "_active_tools", self.tools)
-        tools = [tool.tool_schema for tool in active_tools.values()]
+        tools = [] # not used
         _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
 
         if agent_data.tool_calls:
@@ -278,7 +289,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         tasks = []
         tool_call_names = []
-        for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
+        for tool_call in agent_data.tool_calls:
             tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
             tool_call_names.append(tool_call.name)
 
@@ -377,13 +388,7 @@ class ToolAgentLoop(AgentLoopBase):
     async def _call_tool(
         self, tool_call: FunctionCall, tools_kwargs: dict[str, Any], agent_data: AgentData
     ) -> tuple[ToolResponse, float, dict]:
-        """Call tool and return tool response.
-
-        Dispatches between two contracts:
-        - ``FunctionTool``: stateless function-based tool. Invoked directly with
-          parsed arguments; no lifecycle.
-        - ``BaseTool`` subclass: stateful tool with full lifecycle.
-        """
+        """Call tool and return tool response."""
         active_tools = getattr(agent_data, "_active_tools", self.tools)
 
         # Validate tool name
@@ -405,31 +410,32 @@ class ToolAgentLoop(AgentLoopBase):
         # Execute tool
         tool, instance_id = None, None
         try:
-            tool = active_tools[tool_name]
+            server_name = tool_name.split("-")[0]
+            client_id = f"{server_name}-{agent_data.request_id}"
+            if client_id not in agent_data.client_ids:
+                agent_data.client_ids.append(client_id)
 
-            if isinstance(tool, FunctionTool):
-                # Function-based tools have no lifecycle; call directly.
-                # Note: tools_kwargs (create_kwargs / release_kwargs) is intentionally
-                # ignored here. Function tools are stateless and per-trajectory state
-                # injection is not supported by design; use a BaseTool subclass instead.
-                raw = await tool.call(tool_args)
-                tool_execution_response, tool_reward, res = normalize_function_tool_return(raw)
-            else:
-                # BaseTool subclass
-                kwargs = tools_kwargs.get(tool_name, {})
-                instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
-                tool_execution_response, tool_reward, res = await tool.execute(
-                    instance_id, tool_args, agent_data=agent_data
+            # Load scenario
+            if client_id not in agent_data.loaded_client_ids:
+                await self.mcp_manager_actor.call_tool.remote(
+                    client_id = client_id,
+                    tool_name = f"{server_name}-load_scenario",
+                    tool_args = {"scenario": agent_data.initial_config[server_name]},
                 )
+                agent_data.loaded_client_ids.add(client_id)
+
+            # Call tool
+            tool_execution_response = await self.mcp_manager_actor.call_tool.remote(
+                client_id = client_id,
+                tool_name = tool_name,
+                tool_args = tool_args,
+            )
+
         except Exception as e:
             logger.warning(f"Error executing tool '{tool_name}': {e}")
             return ToolResponse(text=f"Error executing tool '{tool_name}': {e}"), 0.0, {}
-        finally:
-            # Only BaseTool instances need release (function tools never set instance_id).
-            if tool and instance_id and not isinstance(tool, FunctionTool):
-                await tool.release(instance_id)
 
-        tool_response_text = tool_execution_response.text
+        tool_response_text = tool_execution_response
         if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
             if self.tool_response_truncate_side == "left":
                 tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
@@ -449,4 +455,4 @@ class ToolAgentLoop(AgentLoopBase):
                 if attr_value is not None:
                     tool_response_kwargs[attr_name] = attr_value
 
-        return ToolResponse(**tool_response_kwargs), tool_reward, res
+        return ToolResponse(**tool_response_kwargs), 0.0, {}

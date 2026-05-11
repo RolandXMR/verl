@@ -19,6 +19,8 @@ import logging
 import os
 import re
 import traceback
+import json
+import ray
 from collections import defaultdict
 from io import BytesIO
 from typing import Optional
@@ -33,6 +35,8 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from verl.utils.import_utils import load_extern_object
 from verl.utils.tokenizer import normalize_token_ids
+
+from EnvFactory.configs.system_prompt import ASSISTANT_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -114,21 +118,11 @@ class RLHFDataset(Dataset):
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        self.reward_scheduler = config.get("reward_scheduler", {})
 
-        self.tool_config_path = config.get("tool_config_path", None)
-        self.tool_schemas = None
-        if self.tool_config_path:
-            try:
-                from verl.tools.utils.tool_registry import initialize_tools_from_config
-
-                tool_list = initialize_tools_from_config(self.tool_config_path)
-                # match ToolAgentLoop behaviour: model_dump to plain dicts
-                self.tool_schemas = [
-                    tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list
-                ]
-            except Exception as e:
-                logger.warning("Failed to initialize tools from %s: %s", self.tool_config_path, e)
-                self.tool_schemas = None
+        self.mcp_manager_actor = ray.get_actor("mcp_manager_actor")
+        self.tools = ray.get(self.mcp_manager_actor.get_tools.remote())
+        self.tool_schemas = ray.get(self.mcp_manager_actor.get_tool_schemas.remote())
 
         self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
         self.num_workers = min(self.num_workers, os.cpu_count()) if self.num_workers is not None else None
@@ -188,6 +182,17 @@ class RLHFDataset(Dataset):
             image_key = self.image_key
             video_key = self.video_key
 
+            def filter_tools(mcp_servers: list[str]) -> list[dict]:
+                if mcp_servers is None:
+                    return self.tool_schemas
+
+                filtered_tools = []
+                for name, schema in self.tools.items():
+                    server_name, _, tool_name = name.partition("-")
+                    if server_name in mcp_servers and tool_name not in ["load_scenario", "save_scenario"]:
+                        filtered_tools.append(schema)
+                return filtered_tools
+
             if processor is not None:
                 from verl.utils.dataset.vision_utils import process_image, process_video
 
@@ -196,8 +201,9 @@ class RLHFDataset(Dataset):
                         messages = self._build_messages(doc, key=self.prompt_key)
                         # pass tool schemas if available so the processor can format prompts
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
+                        mcp_servers = json.loads(doc['extra_info']['mcp_factory_kwargs']['mcp_servers'])
                         if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
+                            apply_kwargs["tools"] = filter_tools(mcp_servers)
 
                         raw_prompt = self.processor.apply_chat_template(
                             messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
@@ -252,8 +258,9 @@ class RLHFDataset(Dataset):
                 def doc2len(doc) -> int:
                     try:
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
+                        mcp_servers = json.loads(doc['extra_info']['mcp_factory_kwargs']['mcp_servers'])
                         if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
+                            apply_kwargs["tools"] = filter_tools(mcp_servers)
 
                         # Keep explicit tokenization to avoid transformers version default changes.
                         apply_kwargs.pop("tokenize", None)
@@ -313,6 +320,10 @@ class RLHFDataset(Dataset):
             messages: List of messages with replaced placeholder.
         """
         messages: list = example[key]
+        if isinstance(messages, str):
+            messages = json.loads(messages)
+        messages = [{"role": "system", "content": ASSISTANT_SYSTEM_PROMPT}] + messages
+
         # When concatenating image and video datasets, get will return None for image or video sample
         images = example.get(self.image_key, None) or []
         videos = example.get(self.video_key, None) or []
@@ -378,6 +389,15 @@ class RLHFDataset(Dataset):
             logger.warning("tools_kwargs is empty for index %s, data source: %s", index, row_dict["data_source"])
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
+        row_dict['extra_info']["reward_scheduler"] = self.reward_scheduler
+        row_dict["interaction_kwargs"] = row_dict.get("extra_info", {}).get("interaction_kwargs", {})
+        mcp_factory_kwargs = row_dict.get("extra_info", {}).get("mcp_factory_kwargs", {})
+        for k, v in mcp_factory_kwargs.items():
+            try:
+                row_dict[k] = json.loads(v)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to decode JSON for key {k} in mcp_factory_kwargs: {e}")
+                row_dict[k] = v
         return row_dict
 
     @classmethod

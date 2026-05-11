@@ -32,6 +32,8 @@ from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_extern_object
 
+from EnvFactory.manager.mcp_client_manager import MCPManagerActor
+
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
@@ -76,6 +78,12 @@ def run_ppo(config, task_runner_class=None) -> None:
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
+
+    # Create a shared MCPManagerActor
+    mcp_config_path = os.environ.get("MCP_CONFIG_PATH")
+    assert mcp_config_path is not None, "MCP_CONFIG_PATH environment variable must be set inside .env."
+    mcp_actor = MCPManagerActor.options(name="mcp_manager_actor", lifetime="detached").remote()
+    ray.get(mcp_actor.init_config.remote(mcp_config_path))
 
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
