@@ -32,7 +32,6 @@ actor_rollout_ref:
     name: sglang
     multi_turn:
       enable: true
-      interaction_config_path: null
       max_user_turns: 10
       max_assistant_turns: 10
       max_tool_response_length: 512
