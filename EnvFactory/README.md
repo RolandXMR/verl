@@ -1,4 +1,4 @@
-# Modification
+## Modification
 ```
 📁 EnvFactory/
 ├── 📁 configs/
@@ -23,7 +23,15 @@
         └── 📄 rl_dataset.py
 ```
 
+## Setup
+Please configure the `.env` as follow:
 ```
 MCP_CONFIG_PATH=EnvFactory/configs/mcp_server.json
 LOGGING_LEVEL=WARN
+```
+
+Please install the following packages based on the VeRL environments:
+```
+pip install jsonlines
+pip install fastmcp==3.1.0
 ```

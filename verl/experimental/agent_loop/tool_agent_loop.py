@@ -157,7 +157,7 @@ class ToolAgentLoop(AgentLoopBase):
             for name, schema in self.tools.items():
                 server_name, _, tool_name = name.partition("-")
                 if server_name in mcp_servers and tool_name not in ["load_scenario", "save_scenario"]:
-                    active_tools[tool_name] = schema
+                    active_tools[name] = schema
                     active_tool_schemas.append(schema)
             agent_data._active_tools = active_tools
             agent_data._active_tool_schemas = active_tool_schemas
@@ -180,9 +180,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Save scenarios and close clients
         if agent_data.client_ids:
-            final_scenarios = await self.mcp_manager_actor.save_and_close_clients.remote(
-                client_ids=agent_data.client_ids,
-            )
+            final_scenarios = await self.mcp_manager_actor.save_and_close_clients.remote(client_ids=agent_data.client_ids)
         else:
             final_scenarios = {}
 
