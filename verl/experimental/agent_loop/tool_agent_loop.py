@@ -113,7 +113,7 @@ class ToolAgentLoop(AgentLoopBase):
         self.max_tool_response_length = self.rollout_config.multi_turn.max_tool_response_length
         self.tool_response_truncate_side = self.rollout_config.multi_turn.tool_response_truncate_side
 
-        self.mcp_manager_actor = ray.get_actor("mcp_manager")
+        self.mcp_manager_actor = ray.get_actor("mcp_manager_actor")
         self.tools = ray.get(self.mcp_manager_actor.get_tools.remote())
         self.tool_schemas = ray.get(self.mcp_manager_actor.get_tool_schemas.remote())
         logger.info(f"✅ Load {len(self.tools)} tools")
