@@ -15,8 +15,8 @@ CONFIG_NAME="env_factory_config"
 TIMESTAMP="$(date +"%Y%m%d-%H%M")"
 BACKEND=sglang
 
-MODEL_NAME=EnvFactory-RL-1.7B
-MODEL_PATH=/data/user/mxubh/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+MODEL_NAME=EnvFactory-RL-4B-Thinking
+MODEL_PATH=//mnt/public/dengheyuan/models/Qwen3-4B-Thinking-2507
 
 EXP_NAME="$MODEL_NAME-n8-$BACKEND-no_kl-grpo-1e-6-0.7"
 
@@ -31,14 +31,13 @@ python3 -m verl.trainer.main_ppo \
     data.max_prompt_length=16384 \
     data.max_response_length=8192 \
     data.filter_overlong_prompts=False \
-    data.trace_reward_weight=0.5 \
     reward.custom_reward_function.path=EnvFactory/reward/tool_reward_fcn.py \
     reward.custom_reward_function.name=compute_tool_reward \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -50,7 +49,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=0.7 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.trace.backend=tensorboard \
     actor_rollout_ref.rollout.trace.token2text=True \
