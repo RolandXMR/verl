@@ -257,6 +257,7 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     try:
+                        messages = self._build_messages(doc, key=self.prompt_key)
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
                         mcp_servers = json.loads(doc['extra_info']['mcp_factory_kwargs']['mcp_servers'])
                         if self.tool_schemas is not None:
@@ -268,7 +269,7 @@ class RLHFDataset(Dataset):
                         apply_kwargs.pop("return_tensors", None)
 
                         tokenized_prompt = tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True, tokenize=True, **apply_kwargs
+                            messages, add_generation_prompt=True, tokenize=True, **apply_kwargs
                         )
                         return len(normalize_token_ids(tokenized_prompt))
                     except Exception:

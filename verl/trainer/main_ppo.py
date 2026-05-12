@@ -30,7 +30,7 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 
-from EnvFactory.manager.mcp_client_manager import MCPManagerActor
+from EnvFactory.manager.mcp_manager import MCPManagerActor
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
