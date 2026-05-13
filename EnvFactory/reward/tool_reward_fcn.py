@@ -158,9 +158,11 @@ def _compute_state_score(solution: str | dict, ground_truth: str | dict, mcp_ser
     Return partial score for each of correctly matched MCP server configuration.
     """
     solution = to_JSON(solution)
+    solution = {k: to_JSON(v) for k, v in solution.items()}
+
     ground_truth = to_JSON(ground_truth)
     ground_truth = {k: v for k, v in ground_truth.items() if k in mcp_servers} # filter out non-used MCP servers
-    
+
     matches = sum(1 for server, config in ground_truth.items() if solution.get(server) == config)
     return matches / len(ground_truth) if ground_truth else 0.0
 

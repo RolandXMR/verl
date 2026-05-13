@@ -88,6 +88,7 @@ class AgentData:
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
 
+        # MCP client management
         self.client_ids = []
         self.loaded_client_ids = set()
         self.initial_config = initial_config
@@ -175,7 +176,8 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Save scenarios and close clients
         if agent_data.client_ids:
-            final_scenarios = await self.mcp_manager_actor.save_and_close_clients.remote(client_ids=agent_data.client_ids)
+            with simple_timer("save_and_close_clients", agent_data.metrics):
+                final_scenarios = await self.mcp_manager_actor.save_and_close_clients.remote(client_ids=agent_data.client_ids)
         else:
             final_scenarios = {}
 
