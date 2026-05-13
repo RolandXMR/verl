@@ -19,9 +19,11 @@ from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
 
+import ray
 import torch
 from PIL import Image
 
+from EnvFactory.configs.utils import EXCLUDED_TOOLS
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
     AgentLoopOutput,
@@ -35,8 +37,6 @@ from verl.tools.schemas import ToolResponse
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
-
-import ray
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -152,7 +152,7 @@ class ToolAgentLoop(AgentLoopBase):
             active_tool_schemas = []
             for name, schema in self.tools.items():
                 server_name, _, tool_name = name.partition("-")
-                if server_name in mcp_servers and tool_name not in ["load_scenario", "save_scenario"]:
+                if server_name in mcp_servers and tool_name not in EXCLUDED_TOOLS:
                     active_tools[name] = schema
                     active_tool_schemas.append(schema)
             agent_data._active_tools = active_tools

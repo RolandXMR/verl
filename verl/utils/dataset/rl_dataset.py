@@ -33,10 +33,9 @@ from PIL import Image
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
+from EnvFactory.configs.utils import EXCLUDED_SERVERS, EXCLUDED_TOOLS, ASSISTANT_SYSTEM_PROMPT
 from verl.utils.import_utils import load_extern_object
 from verl.utils.tokenizer import normalize_token_ids
-
-from EnvFactory.configs.system_prompt import ASSISTANT_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +188,7 @@ class RLHFDataset(Dataset):
                 filtered_tools = []
                 for name, schema in self.tools.items():
                     server_name, _, tool_name = name.partition("-")
-                    if server_name in mcp_servers and tool_name not in ["load_scenario", "save_scenario"]:
+                    if server_name in mcp_servers and server_name not in EXCLUDED_SERVERS and tool_name not in EXCLUDED_TOOLS:
                         filtered_tools.append(schema)
                 return filtered_tools
 
@@ -199,9 +198,12 @@ class RLHFDataset(Dataset):
                 def doc2len(doc) -> int:
                     try:
                         messages = self._build_messages(doc, key=self.prompt_key)
+                        mcp_servers = json.loads(doc['extra_info']['mcp_factory_kwargs']['mcp_servers'])
+                        if any(mcp_server in EXCLUDED_SERVERS for mcp_server in mcp_servers): # ignore excluded servers
+                            return self.max_prompt_length + 1
+
                         # pass tool schemas if available so the processor can format prompts
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        mcp_servers = json.loads(doc['extra_info']['mcp_factory_kwargs']['mcp_servers'])
                         if self.tool_schemas is not None:
                             apply_kwargs["tools"] = filter_tools(mcp_servers)
 
@@ -258,8 +260,11 @@ class RLHFDataset(Dataset):
                 def doc2len(doc) -> int:
                     try:
                         messages = self._build_messages(doc, key=self.prompt_key)
-                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
                         mcp_servers = json.loads(doc['extra_info']['mcp_factory_kwargs']['mcp_servers'])
+                        if any(mcp_server in EXCLUDED_SERVERS for mcp_server in mcp_servers): # ignore excluded servers
+                            return self.max_prompt_length + 1
+
+                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
                         if self.tool_schemas is not None:
                             apply_kwargs["tools"] = filter_tools(mcp_servers)
 

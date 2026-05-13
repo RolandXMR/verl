@@ -197,7 +197,10 @@ class MCPManager:
         future = asyncio.run_coroutine_threadsafe(
             self._save_and_close_clients_async(client_ids), self.loop,
         )
-        return future.result(timeout=60)
+        try:
+            return future.result(timeout=60)
+        except TimeoutError:
+            return {cid.split("-")[0]: {} for cid in client_ids}
 
     async def _close_all_base_clients_async(self):
         clients = list(self._base_clients.values())

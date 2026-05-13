@@ -15,8 +15,11 @@ CONFIG_NAME="env_factory_config"
 TIMESTAMP="$(date +"%Y%m%d-%H%M")"
 BACKEND=sglang
 
-MODEL_NAME=EnvFactory-RL-4B-Thinking
-MODEL_PATH=//mnt/public/dengheyuan/models/Qwen3-4B-Thinking-2507
+MODEL_NAME=EnvFactory-RL-30B-A3B-Thinking
+MODEL_PATH=//mnt/public/dengheyuan/models/Qwen3-30B-A3B-Thinking-2507
+
+# MODEL_NAME=EnvFactory-RL-35B-A3B
+# MODEL_PATH=//mnt/public/dengheyuan/models/Qwen3.5-35B-A3B
 
 EXP_NAME="$MODEL_NAME-n8-$BACKEND-no_kl-grpo-1e-6-0.7"
 
@@ -37,7 +40,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -49,7 +52,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=0.7 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.trace.backend=wandb \
     actor_rollout_ref.rollout.trace.token2text=True \

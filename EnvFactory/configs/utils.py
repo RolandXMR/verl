@@ -1,3 +1,6 @@
+EXCLUDED_SERVERS = ["ClinicalTrialsGov"]
+EXCLUDED_TOOLS = ["load_scenario", "save_scenario"]
+
 ASSISTANT_SYSTEM_PROMPT = '''You are a helpful assistant. Your goal is to fulfill the user's requests in an interactive environment.
 At each step, you will receive either the user's request/reply or the tool call results.
 - Choose the appropriate tool from the available set and provide complete, valid parameters.
