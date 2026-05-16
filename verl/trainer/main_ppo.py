@@ -22,6 +22,8 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
+from dotenv import load_dotenv
+
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.distillation import is_distillation_enabled
@@ -30,7 +32,7 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 
-from EnvFactory.manager.mcp_manager import MCPManagerActor
+load_dotenv()
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -77,10 +79,16 @@ def run_ppo(config, task_runner_class=None) -> None:
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
-    # Create a shared MCPManagerActor
+    # Create MCPManagerActor or ToolManagerActor
+    use_fastmcp = os.environ.get("USE_FASTMCP", "TRUE").upper() == "TRUE"
     mcp_config_path = os.environ.get("MCP_CONFIG_PATH")
     assert mcp_config_path is not None, "MCP_CONFIG_PATH environment variable must be set inside .env."
-    mcp_actor = MCPManagerActor.options(name="mcp_manager_actor", lifetime="detached").remote()
+    if use_fastmcp:
+        from EnvFactory.manager.mcp_manager import MCPManagerActor
+        mcp_actor = MCPManagerActor.options(name="mcp_manager_actor", lifetime="detached").remote()
+    else:
+        from EnvFactory.manager.tool_manager import ToolManagerActor
+        mcp_actor = ToolManagerActor.options(name="mcp_manager_actor", lifetime="detached").remote()
     ray.get(mcp_actor.init_config.remote(mcp_config_path))
 
     if task_runner_class is None:

@@ -3,10 +3,9 @@ import json
 import logging
 import os
 import threading
-import ray
-from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
+import ray
 from dotenv import load_dotenv
 from fastmcp import Client
 
@@ -17,7 +16,7 @@ logger.setLevel(os.getenv("LOGGING_LEVEL", "WARN"))
 
 
 class MCPManager:
-    """Manages multiple concurrent MCP clients."""
+    """Manages multiple concurrent MCP clients using FastMCP."""
     _instance = None  # Private class variable to store the unique instance
 
     def __new__(cls, *args, **kwargs):
@@ -31,7 +30,6 @@ class MCPManager:
             self._initialized = False
 
             # Client management
-            self._base_clients: Dict[str, Client] = {} # base clients for each stateful client
             self.clients: Dict[str, dict] = {} # stateful clients
             self.stateless_clients: Dict[str, Client] = {} # stateless clients
             self.server_to_path_mapping: Dict[str, str] = {}
@@ -45,7 +43,7 @@ class MCPManager:
     def start_loop(self):
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
-    
+
     async def register_mcp_server_async(self, server_name: str, server_path: str, is_stateless: bool = False):
         """Register an MCP server and extract tool schemas."""
         client = Client(server_path)
@@ -70,7 +68,7 @@ class MCPManager:
         if is_stateless:
             self.stateless_clients[server_name] = client
         else:
-            self._base_clients[server_name] = client
+            await client.close()
 
     async def _init_config_async(self, config: dict):
         """Async initialization of all configured servers."""
@@ -99,7 +97,7 @@ class MCPManager:
             self._init_config_async(config), self.loop,
         )
         return future.result(timeout=150)
-    
+
     def filter_tools(self, servers: Optional[List[str]] = None) -> List[dict]:
         """Filter tools by server names."""
         if servers is None:
@@ -123,13 +121,8 @@ class MCPManager:
         if server_name in self.stateless_clients:
             return self.stateless_clients[server_name], True
 
-        if server_name in self._base_clients:
-            base_client = self._base_clients[server_name]
-        else:
-            base_client = Client(self.server_to_path_mapping[server_name])
-            self._base_clients[server_name] = base_client
-
-        client = base_client.new()
+        server_path = self.server_to_path_mapping[server_name]
+        client = Client(server_path)
         self.clients[client_id] = {"client": client, "loaded": False}
         return client, False
 
@@ -141,16 +134,13 @@ class MCPManager:
         if "load_scenario" == name and loaded:
             return "Already loaded scenario, skipping load."
 
-        if client.is_connected():
-            result = await client.call_tool(name, args)
-        else:
+        if not client.is_connected():
             await client._connect()
-            result = await client.call_tool(name, args)
-
+        result = await client.call_tool(name, args)
         return ",".join(item.text for item in result.content if hasattr(item, "text"))
 
     def call_tool(self, client_id: str, tool_name: str, tool_args: dict | str):
-        """Sync wrapper to call a tool."""""
+        """Sync wrapper to call a tool."""
         future = asyncio.run_coroutine_threadsafe(
             self._call_tool_async(client_id, tool_name, tool_args), self.loop,
         )
@@ -202,15 +192,6 @@ class MCPManager:
         except TimeoutError:
             return {cid.split("-")[0]: {} for cid in client_ids}
 
-    async def _close_all_base_clients_async(self):
-        clients = list(self._base_clients.values())
-        self._base_clients.clear()
-
-        await asyncio.gather(
-            *(c.close() for c in clients),
-            return_exceptions=True,
-        )
-
     async def _close_all_stateless_clients_async(self):
         clients = list(self.stateless_clients.values())
         self.stateless_clients.clear()
@@ -244,10 +225,6 @@ class MCPManager:
             return
 
         asyncio.run_coroutine_threadsafe(
-            self._close_all_base_clients_async(), self.loop
-        ).result(timeout=timeout)
-
-        asyncio.run_coroutine_threadsafe(
             self._close_all_stateless_clients_async(), self.loop
         ).result(timeout=timeout)
 
@@ -276,11 +253,9 @@ class MCPManagerActor:
 
     # Data access
     def get_tools(self) -> Dict[str, dict]:
-        """Return the ``{tool_name: schema}`` dict."""
         return self._manager.tools
 
     def get_tool_schemas(self) -> List[dict]:
-        """Return a flat list of tool schema dicts."""
         return list(self._manager.tools.values())
 
     def get_server_to_path_mapping(self) -> Dict[str, str]:

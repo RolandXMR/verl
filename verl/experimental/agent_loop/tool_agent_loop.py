@@ -24,6 +24,7 @@ import torch
 from PIL import Image
 
 from EnvFactory.configs.utils import EXCLUDED_TOOLS
+import EnvFactory.utils.tool_parser
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
     AgentLoopOutput,
@@ -386,8 +387,12 @@ class ToolAgentLoop(AgentLoopBase):
         """Call tool and return tool response."""
         active_tools = getattr(agent_data, "_active_tools", self.tools)
 
-        # Validate tool name
+        # Invalid tool call format
         tool_name = tool_call.name
+        if tool_name == "Invalid":
+            return ToolResponse(text=tool_call.arguments), 0.0, {}
+
+        # Validate tool name
         if tool_name not in active_tools:
             available = list(active_tools.keys())
             msg = f"Unknown function '{tool_name}'. Available tools: {available}"
