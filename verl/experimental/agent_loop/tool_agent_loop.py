@@ -111,10 +111,10 @@ class ToolAgentLoop(AgentLoopBase):
         self.max_parallel_calls = self.rollout_config.multi_turn.max_parallel_calls
         self.max_tool_response_length = self.rollout_config.multi_turn.max_tool_response_length
         self.tool_response_truncate_side = self.rollout_config.multi_turn.tool_response_truncate_side
-        env_config_path = self.rollout_config.multi_turn.get("environment_config_path", None)
-        if env_config_path:
+        tool_config_path = self.rollout_config.multi_turn.tool_config_path
+        if tool_config_path:
             from src.tools.tool_manager import get_tool_manager
-            self.tool_manager = get_tool_manager(env_config_path)
+            self.tool_manager = get_tool_manager(tool_config_path)
         else:
             self.tool_manager = None
         self.tool_parser = ToolParser.get_tool_parser(self.rollout_config.multi_turn.format, self.tokenizer)

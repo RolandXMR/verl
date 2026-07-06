@@ -116,15 +116,15 @@ class RLHFDataset(Dataset):
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
 
-        self.environment_config_path = config.get("environment_config_path", None)
+        self.tool_config_path = config.get("tool_config_path", None)
         self.tool_manager = None
-        if self.environment_config_path:
+        if self.tool_config_path:
             try:
                 from src.tools.tool_manager import get_tool_manager
 
-                self.tool_manager = get_tool_manager(self.environment_config_path)
+                self.tool_manager = get_tool_manager(self.tool_config_path)
             except Exception as e:
-                logger.warning("❌ Failed to load tool manager from %s: %s", self.environment_config_path, e)
+                logger.warning("❌ Failed to load tool manager from %s: %s", self.tool_config_path, e)
                 self.tool_manager = None
 
         self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
