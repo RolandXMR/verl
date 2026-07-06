@@ -32,7 +32,6 @@ from verl.experimental.agent_loop.utils import build_gpt_oss_tool_response_text
 from verl.interactions.base import BaseInteraction
 from verl.interactions.utils.interaction_registry import initialize_interactions_from_config
 from verl.tools.schemas import ToolResponse
-from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -61,6 +60,7 @@ class AgentData:
         metrics: dict[str, Any],
         request_id: str,
         tools_kwargs: dict[str, Any],
+        initial_state: Optional[dict[str, Any]] = None,
         interaction: Optional[BaseInteraction] = None,
         interaction_kwargs: Optional[dict[str, Any]] = None,
     ):
@@ -86,6 +86,14 @@ class AgentData:
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
 
+        # Per-sample tool schemas and env client lifecycle
+        self.initial_state = initial_state or {}  # EnvName -> initial state
+        self.tool_schemas: list[dict[str, Any]] = []
+        self.tool_schema_objs: list[Any] = []
+        self.tools: dict[str, dict[str, Any]] = {}
+        self.client_ids: dict[str, str] = {}  # EnvName -> client id
+        self.rollout_state: dict[str, Any] = {}  # EnvName -> final state after rollout
+
         self.routed_experts = None
 
         # Extra fields for dynamic addition, e.g., tool session data
@@ -103,10 +111,12 @@ class ToolAgentLoop(AgentLoopBase):
         self.max_parallel_calls = self.rollout_config.multi_turn.max_parallel_calls
         self.max_tool_response_length = self.rollout_config.multi_turn.max_tool_response_length
         self.tool_response_truncate_side = self.rollout_config.multi_turn.tool_response_truncate_side
-        tool_config_path = self.rollout_config.multi_turn.tool_config_path
-        tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
-        self.tools = {tool.name: tool for tool in tool_list}
-        self.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
+        env_config_path = self.rollout_config.multi_turn.get("environment_config_path", None)
+        if env_config_path:
+            from src.tools.tool_manager import get_tool_manager
+            self.tool_manager = get_tool_manager(env_config_path)
+        else:
+            self.tool_manager = None
         self.tool_parser = ToolParser.get_tool_parser(self.rollout_config.multi_turn.format, self.tokenizer)
         self.tool_parser_name = self.rollout_config.multi_turn.format
 
@@ -132,6 +142,8 @@ class ToolAgentLoop(AgentLoopBase):
         metrics = {}
         request_id = uuid4().hex
         tools_kwargs = kwargs.get("tools_kwargs", {})
+        initial_state = kwargs.get("initial_state", {})
+        envs = kwargs.get("envs", [])
 
         # Initialize interaction if needed
         interaction = None
@@ -148,6 +160,7 @@ class ToolAgentLoop(AgentLoopBase):
                 )
             interaction = self.interaction_map[interaction_name]
             await interaction.start_interaction(request_id, **interaction_kwargs)
+
         # Create AgentData instance to encapsulate all state
         agent_data = AgentData(
             messages=messages,
@@ -156,9 +169,16 @@ class ToolAgentLoop(AgentLoopBase):
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
+            initial_state=initial_state,
             interaction=interaction,
             interaction_kwargs=interaction_kwargs,
         )
+
+        # Get tool schemas
+        if self.tool_manager is not None and envs:
+            agent_data.tool_schemas = self.tool_manager.filter_tools(envs)
+            agent_data.tool_schema_objs = self.tool_manager.filter_tools(envs, return_dict=False)
+            agent_data.tools = {s["function"]["name"]: s for s in agent_data.tool_schemas}
 
         # State machine loop
         state = AgentState.PENDING
@@ -174,6 +194,13 @@ class ToolAgentLoop(AgentLoopBase):
             else:
                 logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
+        
+        # Close clients and save rollout states
+        for env, client_id in agent_data.client_ids.items():
+            try:
+                agent_data.rollout_state[env] = self.tool_manager.close_client(client_id)
+            except Exception as e:
+                logger.warning(f"⚠️ Error closing client {client_id}: {e}.")
 
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
@@ -198,13 +225,14 @@ class ToolAgentLoop(AgentLoopBase):
             extra_fields=agent_data.extra_fields,
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+        output.extra_fields["rollout_state"] = agent_data.rollout_state
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
         prompt_ids = await self.apply_chat_template(
             agent_data.messages,
-            tools=self.tool_schemas,
+            tools=agent_data.tool_schemas,
             images=agent_data.image_data,
             videos=agent_data.video_data,
         )
@@ -259,8 +287,9 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
 
         # Extract tool calls
-        tools = [tool.tool_schema for tool in self.tools.values()]
-        _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
+        _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(
+            agent_data.response_ids, agent_data.tool_schema_objs
+        )
 
         # Handle interaction if needed
         if self.interaction_config_file:
@@ -286,7 +315,7 @@ class ToolAgentLoop(AgentLoopBase):
         tasks = []
         tool_call_names = []
         for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
-            tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
+            tasks.append(self._call_tool(tool_call, agent_data))
             tool_call_names.append(tool_call.name)
 
         with simple_timer("tool_calls", agent_data.metrics):
@@ -418,35 +447,37 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             return AgentState.GENERATING
 
-    async def _call_tool(
-        self, tool_call: FunctionCall, tools_kwargs: dict[str, Any], agent_data: AgentData
-    ) -> tuple[ToolResponse, float, dict]:
+    async def _call_tool(self, tool_call: FunctionCall, agent_data: AgentData) -> tuple[ToolResponse, float, dict]:
         """Call tool and return tool response."""
-        tool, instance_id = None, None
-        try:
-            # TODO: append malformed tool_call to the prompt: invalid function name or arguments
-            tool_name = tool_call.name
-            tool_args = json.loads(tool_call.arguments)
-            tool = self.tools[tool_name]
-            kwargs = tools_kwargs.get(tool_name, {})
-            instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
-            tool_execution_response, tool_reward, res = await tool.execute(
-                instance_id, tool_args, agent_data=agent_data
-            )
-        except Exception as e:
-            logger.warning(f"Error when executing tool: {e}")
-            return (
-                ToolResponse(
-                    text=f"Error when executing tool: {e}",
-                ),
-                0.0,
-                {},
-            )
-        finally:
-            if tool and instance_id:
-                await tool.release(instance_id)
+        # Validate tool name
+        tool_name = tool_call.name
+        if tool_name not in agent_data.tools:
+            available = list(agent_data.tools.keys())
+            msg = f"Unknown function '{tool_name}'. Available tools: {available}"
+            logger.warning(f"⚠️ {msg}")
+            return ToolResponse(text=msg), 0.0, {}
 
-        tool_response_text = tool_execution_response.text
+        # Validate tool arguments
+        try:
+            tool_args = json.loads(tool_call.arguments)
+        except (json.JSONDecodeError, TypeError) as e:
+            msg = f"Invalid JSON in arguments for '{tool_name}': {e}"
+            logger.warning(f"⚠️ {msg}")
+            return ToolResponse(text=msg), 0.0, {}
+
+        # Call tool
+        try:
+            env = self.tool_manager.resolve_server(tool_name)
+            client_id = agent_data.client_ids.get(env)
+            if client_id is None:
+                client_id = f"{env}-{agent_data.request_id}"
+                self.tool_manager.get_or_create_client(client_id, agent_data.initial_state.get(env, {}))
+                agent_data.client_ids[env] = client_id
+            tool_response_text = self.tool_manager.call_tool(client_id, tool_name, tool_args)
+        except Exception as e:
+            logger.warning(f"⚠️ Error when executing tool: {e}")
+            return ToolResponse(text=f"Error when executing tool: {e}"), 0.0, {}
+
         if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
             if self.tool_response_truncate_side == "left":
                 tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
@@ -456,17 +487,7 @@ class ToolAgentLoop(AgentLoopBase):
                 length = self.max_tool_response_length // 2
                 tool_response_text = tool_response_text[:length] + "...(truncated)..." + tool_response_text[-length:]
 
-        # Create ToolResponse from tool execution result
-        tool_response_kwargs = {"text": tool_response_text}
-
-        # Add multimedia data if present
-        for attr_name in ["image", "video"]:
-            if hasattr(tool_execution_response, attr_name):
-                attr_value = getattr(tool_execution_response, attr_name)
-                if attr_value is not None:
-                    tool_response_kwargs[attr_name] = attr_value
-
-        return ToolResponse(**tool_response_kwargs), tool_reward, res
+        return ToolResponse(text=tool_response_text), 0.0, {}
 
     def _initialize_interactions(self, interaction_config_file):
         """Initialize interactions from configuration.

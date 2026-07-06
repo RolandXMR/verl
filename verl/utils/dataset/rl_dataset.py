@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import copy
+import json
 import logging
 import os
 import re
@@ -115,20 +116,16 @@ class RLHFDataset(Dataset):
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
 
-        self.tool_config_path = config.get("tool_config_path", None)
-        self.tool_schemas = None
-        if self.tool_config_path:
+        self.environment_config_path = config.get("environment_config_path", None)
+        self.tool_manager = None
+        if self.environment_config_path:
             try:
-                from verl.tools.utils.tool_registry import initialize_tools_from_config
+                from src.tools.tool_manager import get_tool_manager
 
-                tool_list = initialize_tools_from_config(self.tool_config_path)
-                # match ToolAgentLoop behaviour: model_dump to plain dicts
-                self.tool_schemas = [
-                    tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list
-                ]
+                self.tool_manager = get_tool_manager(self.environment_config_path)
             except Exception as e:
-                logger.warning("Failed to initialize tools from %s: %s", self.tool_config_path, e)
-                self.tool_schemas = None
+                logger.warning("❌ Failed to load tool manager from %s: %s", self.environment_config_path, e)
+                self.tool_manager = None
 
         self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
         self.num_workers = min(self.num_workers, os.cpu_count()) if self.num_workers is not None else None
@@ -187,6 +184,7 @@ class RLHFDataset(Dataset):
             prompt_key = self.prompt_key
             image_key = self.image_key
             video_key = self.video_key
+            tool_manager = self.tool_manager
 
             if processor is not None:
                 from verl.utils.dataset.vision_utils import process_image, process_video
@@ -196,8 +194,10 @@ class RLHFDataset(Dataset):
                         messages = self._build_messages(doc)
                         # pass tool schemas if available so the processor can format prompts
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
+                        envs = json.loads(doc.get("envs", "[]"))
+                        tools = tool_manager.filter_tools(envs) if tool_manager else None
+                        if tools:
+                            apply_kwargs["tools"] = tools
 
                         raw_prompt = self.processor.apply_chat_template(
                             messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
@@ -241,8 +241,10 @@ class RLHFDataset(Dataset):
                 def doc2len(doc) -> int:
                     try:
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
+                        envs = json.loads(doc.get("envs", "[]"))
+                        tools = tool_manager.filter_tools(envs) if tool_manager else None
+                        if tools:
+                            apply_kwargs["tools"] = tools
 
                         # Keep explicit tokenization to avoid transformers version default changes.
                         apply_kwargs.pop("tokenize", None)
@@ -302,6 +304,8 @@ class RLHFDataset(Dataset):
             messages: List of messages with replaced placeholder.
         """
         messages: list = example[self.prompt_key]
+        if isinstance(messages, str):
+            messages = json.loads(messages)
         # When concatenating image and video datasets, pop will return None for image or video sample
         images = example.pop(self.image_key, None) or []
         videos = example.pop(self.video_key, None) or []
@@ -366,6 +370,11 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+
+        initial_state = row_dict.get("extra_info", {}).get("initial_state")
+        row_dict["initial_state"] = json.loads(initial_state) if isinstance(initial_state, str) else (initial_state or {})
+        envs = row_dict.get("envs")
+        row_dict["envs"] = json.loads(envs) if isinstance(envs, str) else (envs or [])
         return row_dict
 
     @classmethod
