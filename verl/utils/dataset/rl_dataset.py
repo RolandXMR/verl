@@ -118,14 +118,16 @@ class RLHFDataset(Dataset):
 
         self.tool_config_path = config.get("tool_config_path", None)
         self.tool_manager = None
+        self.env_to_schemas = {}
         if self.tool_config_path:
             try:
                 from src.tools.tool_manager import get_tool_manager
-
-                self.tool_manager = get_tool_manager(self.tool_config_path)
+                tool_manager = get_tool_manager(self.tool_config_path)
+                self.env_to_schemas = {env: tool_manager.filter_tools([env]) for env in tool_manager.servers}
             except Exception as e:
                 logger.warning("❌ Failed to load tool manager from %s: %s", self.tool_config_path, e)
                 self.tool_manager = None
+                self.env_to_schemas = {}
 
         self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
         self.num_workers = min(self.num_workers, os.cpu_count()) if self.num_workers is not None else None
@@ -184,7 +186,17 @@ class RLHFDataset(Dataset):
             prompt_key = self.prompt_key
             image_key = self.image_key
             video_key = self.video_key
-            tool_manager = self.tool_manager
+            env_to_schemas = self.env_to_schemas
+
+            def _filter_tools(doc) -> Optional[list]:
+                envs = json.loads(doc.get("envs", "[]"))
+                if not envs:
+                    return None
+
+                tools = []
+                for env in envs:
+                    tools.extend(env_to_schemas.get(env, []))
+                return tools
 
             if processor is not None:
                 from verl.utils.dataset.vision_utils import process_image, process_video
@@ -194,8 +206,7 @@ class RLHFDataset(Dataset):
                         messages = self._build_messages(doc)
                         # pass tool schemas if available so the processor can format prompts
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        envs = json.loads(doc.get("envs", "[]"))
-                        tools = tool_manager.filter_tools(envs) if tool_manager else None
+                        tools = _filter_tools(doc)
                         if tools:
                             apply_kwargs["tools"] = tools
 
@@ -241,8 +252,7 @@ class RLHFDataset(Dataset):
                 def doc2len(doc) -> int:
                     try:
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        envs = json.loads(doc.get("envs", "[]"))
-                        tools = tool_manager.filter_tools(envs) if tool_manager else None
+                        tools = _filter_tools(doc)
                         if tools:
                             apply_kwargs["tools"] = tools
 
