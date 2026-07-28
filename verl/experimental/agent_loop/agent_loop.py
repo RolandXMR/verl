@@ -433,12 +433,24 @@ class AgentLoopWorker:
             )
 
         # Load tools once per worker; each trajectory just reuses self.tools.
+        # tool_config_path may point at a ToolManager env registry (JSON) instead of a
+        # verl-native tool config; in that case ToolAgentLoop loads it via ToolManager
+        # and the registry loader here must not be fatal.
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
         function_tool_path = self.rollout_config.multi_turn.function_tool_path
-        self.tools = load_all_tools(
-            tool_config_path=resolve_config_path(tool_config_path) if tool_config_path else None,
-            function_tool_path=resolve_config_path(function_tool_path) if function_tool_path else None,
-        )
+        try:
+            self.tools = load_all_tools(
+                tool_config_path=resolve_config_path(tool_config_path) if tool_config_path else None,
+                function_tool_path=resolve_config_path(function_tool_path) if function_tool_path else None,
+            )
+        except Exception as e:
+            logger.warning(
+                "load_all_tools failed for tool_config_path=%s (expected when it is a "
+                "ToolManager env registry; ToolAgentLoop will load it instead): %s",
+                tool_config_path,
+                e,
+            )
+            self.tools = []
 
         # Load custom agent loop implementations from config path
         agent_loop_config_path = self.rollout_config.agent.agent_loop_config_path

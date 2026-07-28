@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import copy
+import json
 import logging
 import os
 import re
@@ -117,30 +118,20 @@ class RLHFDataset(Dataset):
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
         self.mm_processor_kwargs = config.get("mm_processor_kwargs", {})
 
-        # Mirror AgentLoopWorker's tool loading so length filtering sees the
-        # same schemas the rollout will.
+        # Mirror ToolAgentLoop's tool loading so length filtering sees the
+        # same per-doc schemas the rollout will.
         self.tool_config_path = config.get("tool_config_path", None)
-        self.function_tool_path = config.get("function_tool_path", None)
         self.tool_schemas = None
-        if self.tool_config_path or self.function_tool_path:
+        self.env_to_schemas = {}
+        if self.tool_config_path:
             try:
-                from verl.tools.tool_registry import load_all_tools
+                from src.tools.tool_manager import get_tool_manager
 
-                tool_list = load_all_tools(
-                    tool_config_path=self.tool_config_path,
-                    function_tool_path=self.function_tool_path,
-                )
-                self.tool_schemas = [
-                    tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list
-                ]
+                tool_manager = get_tool_manager(self.tool_config_path)
+                self.env_to_schemas = {env: tool_manager.filter_tools([env]) for env in tool_manager.servers}
             except Exception as e:
-                logger.warning(
-                    "Failed to initialize tools (tool_config_path=%s, function_tool_path=%s): %s",
-                    self.tool_config_path,
-                    self.function_tool_path,
-                    e,
-                )
-                self.tool_schemas = None
+                logger.warning("❌ Failed to load tool manager from %s: %s", self.tool_config_path, e)
+                self.env_to_schemas = {}
 
         self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
         self.num_workers = min(self.num_workers, os.cpu_count()) if self.num_workers is not None else None
@@ -197,16 +188,29 @@ class RLHFDataset(Dataset):
             tokenizer = self.tokenizer
             processor = self.processor
             prompt_key = self.prompt_key
+            env_to_schemas = self.env_to_schemas
+
+            def _filter_tools(doc) -> Optional[list]:
+                envs = doc.get("envs", "[]")
+                envs = json.loads(envs) if isinstance(envs, str) else (envs or [])
+                if not envs:
+                    return None
+
+                tools = []
+                for env in envs:
+                    tools.extend(env_to_schemas.get(env, []))
+                return tools
 
             if processor is not None:
 
                 def doc2len(doc) -> int:
                     try:
                         messages = self._build_messages(doc, key=self.prompt_key)
-                        # pass tool schemas if available so the processor can format prompts
+                        # pass per-doc tool schemas if available so the processor can format prompts
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
+                        tools = _filter_tools(doc)
+                        if tools:
+                            apply_kwargs["tools"] = tools
 
                         raw_prompt = self.processor.apply_chat_template(
                             messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
@@ -245,8 +249,9 @@ class RLHFDataset(Dataset):
                 def doc2len(doc) -> int:
                     try:
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
+                        tools = _filter_tools(doc)
+                        if tools:
+                            apply_kwargs["tools"] = tools
 
                         # Keep explicit tokenization to avoid transformers version default changes.
                         apply_kwargs.pop("tokenize", None)
@@ -308,6 +313,8 @@ class RLHFDataset(Dataset):
             messages: List of messages with replaced placeholder.
         """
         messages: list = example[key]
+        if isinstance(messages, str):
+            messages = json.loads(messages)
         # When concatenating multimodal datasets, get will return None for samples without a modality column.
         images = example.get(self.image_key, None) or []
         videos = example.get(self.video_key, None) or []
@@ -390,6 +397,13 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+
+        initial_state = row_dict.get("extra_info", {}).get("initial_state")
+        row_dict["initial_state"] = (
+            json.loads(initial_state) if isinstance(initial_state, str) else (initial_state or {})
+        )
+        envs = row_dict.get("envs")
+        row_dict["envs"] = json.loads(envs) if isinstance(envs, str) else (envs or [])
         return row_dict
 
     @classmethod
