@@ -125,12 +125,10 @@ class ToolAgentLoop(AgentLoopBase):
         self.tools = {tool.name: tool for tool in tool_list}
         self.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
 
-        # Per-sample ToolManager: filters tool schemas by each sample's envs and
-        # manages env client lifecycle. Takes precedence over the global tool list.
+        # Get tool manager with lru cache
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
         if tool_config_path:
             from src.tools.tool_manager import get_tool_manager
-
             self.tool_manager = get_tool_manager(tool_config_path)
         else:
             self.tool_manager = None
@@ -333,7 +331,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         tasks = []
         tool_call_names = []
-        for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
+        for tool_call in agent_data.tool_calls: # Call all tools
             tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
             tool_call_names.append(tool_call.name)
 

@@ -204,6 +204,13 @@ class Qwen3XMLToolParser(ToolParser):
         self.tool_call_function_regex = regex.compile(r"<function=(.*?)</function>|<function=(.*)$", regex.DOTALL)
         self.tool_call_parameter_regex = regex.compile(r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", regex.DOTALL)
 
+        self._stop_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+
+    # Fix: Qwen3.5 does not stop generation in multi-turn due to EOS mismatch
+    @property
+    def stop_token_ids(self) -> list[int]:
+        return [self._stop_token_id]
+
     def _parse_xml_function_call(
         self, function_call_str: str, tools: Optional[list[OpenAIFunctionToolSchema]]
     ) -> FunctionCall:
