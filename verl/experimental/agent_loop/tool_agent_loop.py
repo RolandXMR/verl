@@ -91,7 +91,7 @@ class AgentData:
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
 
-        # Per-sample tool schemas and env client lifecycle
+        # Tool manager extra configs
         self.initial_state = initial_state or {}  # EnvName -> initial state
         self.tool_schemas: list[dict[str, Any]] = []
         self.tool_schema_objs: list[Any] = []
@@ -126,10 +126,10 @@ class ToolAgentLoop(AgentLoopBase):
         self.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
 
         # Get tool manager with lru cache
-        tool_config_path = self.rollout_config.multi_turn.tool_config_path
-        if tool_config_path:
+        environment_config_path = self.rollout_config.multi_turn.environment_config_path
+        if environment_config_path:
             from src.tools.tool_manager import get_tool_manager
-            self.tool_manager = get_tool_manager(tool_config_path)
+            self.tool_manager = get_tool_manager(environment_config_path)
         else:
             self.tool_manager = None
         self.tool_parser = ToolParser.get_tool_parser(self.rollout_config.multi_turn.format, self.tokenizer)
@@ -167,7 +167,7 @@ class ToolAgentLoop(AgentLoopBase):
             initial_state=initial_state,
         )
 
-        # Per-sample tool schemas from ToolManager, filtered by this sample's envs
+        # Per-sample tool schemas from tool manager, filtered by this sample's envs
         if self.tool_manager is not None and envs:
             agent_data.tool_schemas = self.tool_manager.filter_tools(envs)
             agent_data.tool_schema_objs = self.tool_manager.filter_tools(envs, return_dict=False)
@@ -463,7 +463,7 @@ class ToolAgentLoop(AgentLoopBase):
         if tool_name not in active_tools:
             available = list(active_tools.keys())
             msg = f"Unknown function '{tool_name}'. Available tools: {available}"
-            logger.warning(msg)
+            logger.warning(f"⚠️ {msg}")
             return ToolResponse(text=msg), 0.0, {}
 
         # Validate tool arguments
@@ -471,10 +471,10 @@ class ToolAgentLoop(AgentLoopBase):
             tool_args = json.loads(tool_call.arguments)
         except (json.JSONDecodeError, TypeError) as e:
             msg = f"Invalid JSON in arguments for '{tool_name}': {e}"
-            logger.warning(msg)
+            logger.warning(f"⚠️ {msg}")
             return ToolResponse(text=msg), 0.0, {}
 
-        # ToolManager path: route the call through the per-sample env client
+        # Execute tool via tool manager
         if self.tool_manager is not None:
             try:
                 env = self.tool_manager.resolve_server(tool_name)
@@ -485,8 +485,9 @@ class ToolAgentLoop(AgentLoopBase):
                     agent_data.client_ids[env] = client_id
                 tool_response_text = self.tool_manager.call_tool(client_id, tool_name, tool_args)
             except Exception as e:
-                logger.warning(f"⚠️ Error when executing tool: {e}")
-                return ToolResponse(text=f"Error when executing tool: {e}"), 0.0, {}
+                msg = f"Error when executing tool: {e}"
+                logger.warning(f"⚠️ {msg}")
+                return ToolResponse(text=msg), 0.0, {}
 
             tool_response_text = self._truncate_tool_response(tool_response_text)
             return ToolResponse(text=tool_response_text), 0.0, {}
