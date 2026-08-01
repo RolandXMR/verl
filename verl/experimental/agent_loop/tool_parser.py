@@ -208,6 +208,16 @@ class Qwen3XMLToolParser(ToolParser):
         self.tool_call_function_regex = regex.compile(r"<function=(.*?)</function>|<function=(.*)$", regex.DOTALL)
         self.tool_call_parameter_regex = regex.compile(r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", regex.DOTALL)
 
+        self._stop_token_ids = [
+            tokenizer.convert_tokens_to_ids("<|im_end|>"),
+            tokenizer.convert_tokens_to_ids("</tool_call>"),
+        ]
+
+    @property
+    def stop_token_ids(self) -> list[int]:
+        "Stop generation for <|im_end|> (Qwen3.5) and </tool_call>."
+        return self._stop_token_ids
+
     def _parse_xml_function_call(
         self, function_call_str: str, tools: Optional[list[OpenAIFunctionToolSchema]]
     ) -> Optional[FunctionCall]:

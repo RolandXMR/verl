@@ -67,6 +67,7 @@ class AgentData:
         metrics: dict[str, Any],
         request_id: str,
         tools_kwargs: dict[str, Any],
+        initial_state: Optional[dict[str, Any]] = None,
     ):
         self.messages = messages
         self.image_data = image_data
@@ -89,6 +90,14 @@ class AgentData:
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
+
+        # Tool manager extra configs
+        self.initial_state = initial_state or {}  # EnvName -> initial state
+        self.tool_schemas: list[dict[str, Any]] = []
+        self.tool_schema_objs: list[Any] = []
+        self.tools: dict[str, dict[str, Any]] = {}
+        self.client_ids: dict[str, str] = {}  # EnvName -> client id
+        self.rollout_state: dict[str, Any] = {}  # EnvName -> final state after rollout
 
         self.routed_experts = None
 
@@ -115,6 +124,14 @@ class ToolAgentLoop(AgentLoopBase):
         tool_list = tools.tools if tools else []
         self.tools = {tool.name: tool for tool in tool_list}
         self.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
+
+        # Get tool manager with lru cache
+        environment_config_path = self.rollout_config.multi_turn.environment_config_path
+        if environment_config_path:
+            from src.tools.tool_manager import get_tool_manager
+            self.tool_manager = get_tool_manager(environment_config_path)
+        else:
+            self.tool_manager = None
         self.tool_parser = ToolParser.get_tool_parser(self.rollout_config.multi_turn.format, self.tokenizer)
         self.tool_parser_name = self.rollout_config.multi_turn.format
 
@@ -135,6 +152,8 @@ class ToolAgentLoop(AgentLoopBase):
         metrics = {}
         request_id = uuid4().hex
         tools_kwargs = kwargs.get("tools_kwargs", {})
+        initial_state = kwargs.get("initial_state", {})
+        envs = kwargs.get("envs", [])
 
         agent_data = AgentData(
             messages=messages,
@@ -145,7 +164,14 @@ class ToolAgentLoop(AgentLoopBase):
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
+            initial_state=initial_state,
         )
+
+        # Per-sample tool schemas from tool manager, filtered by this sample's envs
+        if self.tool_manager is not None and envs:
+            agent_data.tool_schemas = self.tool_manager.filter_tools(envs)
+            agent_data.tool_schema_objs = self.tool_manager.filter_tools(envs, return_dict=False)
+            agent_data.tools = {s["function"]["name"]: s for s in agent_data.tool_schemas}
 
         # Per-sample tool selection: filter global tools by extra_info.tool_selection
         extra_info = kwargs.get("extra_info", {}) or {}
@@ -172,6 +198,13 @@ class ToolAgentLoop(AgentLoopBase):
             else:
                 logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
+
+        # Close env clients and save rollout states
+        for env, client_id in agent_data.client_ids.items():
+            try:
+                agent_data.rollout_state[env] = self.tool_manager.close_client(client_id)
+            except Exception as e:
+                logger.warning(f"⚠️ Error closing client {client_id}: {e}.")
 
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
@@ -203,11 +236,15 @@ class ToolAgentLoop(AgentLoopBase):
             extra_fields=agent_data.extra_fields,
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+        output.extra_fields["rollout_state"] = agent_data.rollout_state
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
-        schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+        if self.tool_manager is not None:
+            schemas = agent_data.tool_schemas
+        else:
+            schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         if self.enable_continuous_token:
             prompt_ids = await self.ct_build_initial_tokens(agent_data.messages, tools=schemas)
         else:
@@ -291,8 +328,11 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
 
         # Extract tool calls (use per-sample tools if routed)
-        active_tools = getattr(agent_data, "_active_tools", self.tools)
-        tools = [tool.tool_schema for tool in active_tools.values()]
+        if self.tool_manager is not None:
+            tools = agent_data.tool_schema_objs
+        else:
+            active_tools = getattr(agent_data, "_active_tools", self.tools)
+            tools = [tool.tool_schema for tool in active_tools.values()]
         assistant_content, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(
             agent_data.response_ids, tools
         )
@@ -312,7 +352,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         tasks = []
         tool_call_names = []
-        for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
+        for tool_call in agent_data.tool_calls: # Call all tools
             tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
             tool_call_names.append(tool_call.name)
 
@@ -484,14 +524,17 @@ class ToolAgentLoop(AgentLoopBase):
           parsed arguments; no lifecycle.
         - ``BaseTool`` subclass: stateful tool with full lifecycle.
         """
-        active_tools = getattr(agent_data, "_active_tools", self.tools)
+        if self.tool_manager is not None:
+            active_tools = agent_data.tools
+        else:
+            active_tools = getattr(agent_data, "_active_tools", self.tools)
 
         # Validate tool name
         tool_name = tool_call.name
         if tool_name not in active_tools:
             available = list(active_tools.keys())
             msg = f"Unknown function '{tool_name}'. Available tools: {available}"
-            logger.warning(msg)
+            logger.warning(f"⚠️ {msg}")
             return ToolResponse(text=msg), 0.0, {}
 
         # Validate tool arguments
@@ -499,8 +542,26 @@ class ToolAgentLoop(AgentLoopBase):
             tool_args = json.loads(tool_call.arguments)
         except (json.JSONDecodeError, TypeError) as e:
             msg = f"Invalid JSON in arguments for '{tool_name}': {e}"
-            logger.warning(msg)
+            logger.warning(f"⚠️ {msg}")
             return ToolResponse(text=msg), 0.0, {}
+
+        # Execute tool via tool manager
+        if self.tool_manager is not None:
+            try:
+                env = self.tool_manager.resolve_server(tool_name)
+                client_id = agent_data.client_ids.get(env)
+                if client_id is None:
+                    client_id = f"{env}-{agent_data.request_id}"
+                    self.tool_manager.get_or_create_client(client_id, agent_data.initial_state.get(env, {}))
+                    agent_data.client_ids[env] = client_id
+                tool_response_text = self.tool_manager.call_tool(client_id, tool_name, tool_args)
+            except Exception as e:
+                msg = f"Error when executing tool: {e}"
+                logger.warning(f"⚠️ {msg}")
+                return ToolResponse(text=msg), 0.0, {}
+
+            tool_response_text = self._truncate_tool_response(tool_response_text)
+            return ToolResponse(text=tool_response_text), 0.0, {}
 
         # Execute tool
         tool, instance_id = None, None
@@ -529,15 +590,7 @@ class ToolAgentLoop(AgentLoopBase):
             if tool and instance_id and not isinstance(tool, FunctionTool):
                 await tool.release(instance_id)
 
-        tool_response_text = tool_execution_response.text
-        if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
-            if self.tool_response_truncate_side == "left":
-                tool_response_text = "(truncated)..." + tool_response_text[-self.max_tool_response_length :]
-            elif self.tool_response_truncate_side == "right":
-                tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
-            else:
-                length = self.max_tool_response_length // 2
-                tool_response_text = tool_response_text[:length] + "...(truncated)..." + tool_response_text[-length:]
+        tool_response_text = self._truncate_tool_response(tool_execution_response.text)
 
         # Create ToolResponse from tool execution result
         tool_response_kwargs = {"text": tool_response_text}
@@ -550,3 +603,15 @@ class ToolAgentLoop(AgentLoopBase):
                     tool_response_kwargs[attr_name] = attr_value
 
         return ToolResponse(**tool_response_kwargs), tool_reward, res
+
+    def _truncate_tool_response(self, tool_response_text: Optional[str]) -> Optional[str]:
+        """Truncate an overlong tool response according to the configured truncate side."""
+        if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
+            if self.tool_response_truncate_side == "left":
+                tool_response_text = "(truncated)..." + tool_response_text[-self.max_tool_response_length :]
+            elif self.tool_response_truncate_side == "right":
+                tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
+            else:
+                length = self.max_tool_response_length // 2
+                tool_response_text = tool_response_text[:length] + "...(truncated)..." + tool_response_text[-length:]
+        return tool_response_text
