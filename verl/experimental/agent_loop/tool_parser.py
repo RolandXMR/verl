@@ -210,12 +210,11 @@ class Qwen3XMLToolParser(ToolParser):
 
         self._stop_token_ids = [
             tokenizer.convert_tokens_to_ids("<|im_end|>"),
-            tokenizer.convert_tokens_to_ids("</tool_call>"),
         ]
 
     @property
     def stop_token_ids(self) -> list[int]:
-        "Stop generation for <|im_end|> (Qwen3.5) and </tool_call>."
+        "Stop generation for <|im_end|> (Qwen3.5)."
         return self._stop_token_ids
 
     def _parse_xml_function_call(
